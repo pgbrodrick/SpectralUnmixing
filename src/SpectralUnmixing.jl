@@ -34,6 +34,7 @@ include("Plotting.jl")
 # Endmember Library Functions
 export SpectralLibrary, load_data!, filter_by_class!, read_envi_wavelengths, interpolate_library_to_new_wavelengths!, remove_wavelength_region_inplace!, scale_library!
 export reduce_endmembers_nmf!, reduce_endmembers_kmeans!, reduce_endmembers_pca!, brightness_normalize!, split_library
+export prepare_combinations, prepare_options, scale_data
 
 # Plotting Functions
 export plot_mean_endmembers, plot_endmembers, plot_endmembers_individually
@@ -63,6 +64,26 @@ function scale_data(refl::Matrix{Float64}, wavelengths::Vector{Float64}, criteri
         else
             norm = sqrt.(mean(refl[good_bands].^2))
         end
+        return refl ./ norm
+    elseif criteria == "region-brightness"
+        wl_regions_norm = [[300,1300],[1500,1700],[2000,2450]]
+        wl_regions_adj = [[300,1320],[1439,1766],[1967,2500]]
+        for (reg_n, reg_a) in zip(wl_regions_norm, wl_regions_adj)
+            good_bands = convert(Vector{Bool}, zeros(length(wavelengths)))
+            good_bands[wl_index(wavelengths, reg_a[1]):wl_index(wavelengths, reg_a[2])] .= true
+
+            norm_bands = convert(Vector{Bool}, zeros(length(wavelengths)))
+            norm_bands[wl_index(wavelengths, reg_n[1]):wl_index(wavelengths, reg_n[2])] .= true
+
+            if length(size(refl)) == 2
+                norm = sqrt.(mean(refl[:,norm_bands].^2, dims=2))
+                refl[:,good_bands] = refl[:,good_bands] ./ norm
+            else
+                norm = sqrt.(mean(refl[norm_bands].^2))
+                refl[good_bands] = refl[good_bands] ./ norm
+            end
+        end
+        return refl
     else
         try
             target_wl = parse(Float64,criteria)
@@ -74,9 +95,9 @@ function scale_data(refl::Matrix{Float64}, wavelengths::Vector{Float64}, criteri
         catch e
             throw(ArgumentError(string("normalization must be [none, brightness, or a specific wavelength].  Provided:", criteria)))
         end
+        return refl ./ norm
     end
 
-    return refl ./ norm
 end
 
 function get_sma_permutation(class_idx, num_endmembers::Vector{Int64}, combination_type::String, library_length::Int64)
@@ -240,6 +261,35 @@ function unmix_pixel(library::SpectralLibrary, img_dat_input::Array{Float64}, un
 
 end
 
+
+function prepare_combinations(library::SpectralLibrary, combination_type::String)
+    class_idx = []
+    if combination_type == "class-even"
+        for uc in library.class_valid_keys
+            push!(class_idx, (1:size(library.classes)[1])[library.classes .== uc])
+        end
+    end
+    return class_idx
+end
+
+function prepare_options(library::SpectralLibrary, combination_type::String, num_endmembers::Vector{Int64}, class_idx)
+
+    # Prepare combinations if relevant
+    options = []
+    if combination_type == "class-even"
+        options = collect(Iterators.product(class_idx...))[:]
+    elseif combination_type == "all"
+        for num in num_endmembers
+            combo = [c for c in combinations(1:length(library.classes), num)]
+            push!(options,combo...)
+        end
+    else
+        error("Invalid combiation string")
+    end
+
+    return options
+end
+
 function unmix_line(line::Int64, reflectance_file::String, mode::String, refl_nodata::Float64,
                     refl_scale::Float64, normalization::String, library::SpectralLibrary,
                     reflectance_uncertainty_file::String = "", n_mc::Int64 = 1,
@@ -268,28 +318,11 @@ function unmix_line(line::Int64, reflectance_file::String, mode::String, refl_no
     scale_data(img_dat, library.wavelengths[library.good_bands], normalization)
     img_dat = img_dat ./ refl_scale
 
-    class_idx = []
-    if combination_type == "class-even"
-        for uc in library.class_valid_keys
-            push!(class_idx, (1:size(library.classes)[1])[library.classes .== uc])
-        end
-    end
-
-    # Prepare combinations if relevant
+    class_idx = prepare_combinations(library, combination_type)
     options = []
     if mode == "mesma"
-        if combination_type == "class-even"
-            options = collect(Iterators.product(class_idx...))[:]
-        elseif combination_type == "all"
-            for num in num_endmembers
-                combo = [c for c in combinations(1:length(library.classes), num)]
-                push!(options,combo...)
-            end
-        else
-            error("Invalid combiation string")
-        end
+        options = prepare_options(library, combination_type, num_endmembers, class_idx)
     end
-
     
     # Solve for each pixel
     for _i in 1:size(img_dat)[1] # Pixel loop
@@ -365,12 +398,7 @@ function simulate_pixel(library::SpectralLibrary, max_components::Int64, combina
     output_mixture = zeros(size(library.spectra)[2])
     output_mixture[:] .= NaN
 
-    class_idx = []
-    if combination_type == "class-even"
-        for uc in library.class_valid_keys
-            push!(class_idx, (1:size(library.classes)[1])[library.classes .== uc])
-        end
-    end
+    class_idx = prepare_combinations(library, combination_type)
     perm = get_sma_permutation(class_idx, [max_components], combination_type, size(library.spectra)[1])
 
     G = library.spectra[perm,:]
