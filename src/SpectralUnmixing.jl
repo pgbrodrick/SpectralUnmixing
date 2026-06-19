@@ -386,6 +386,28 @@ function _unmix_pixel_kernel(library::SpectralLibrary, img_dat::Matrix{Float64},
                     view(ub_bounds, 1:n_vars),
                     1e-3, 100, 1, inverse_method
                 )
+            elseif occursin("nlopt-fast", optimization)
+                n_vars = length(x0)
+                res, cost = nlopt_solve_fast(
+                    G, d[:], x0,
+                    view(lb_bounds, 1:n_vars),
+                    view(ub_bounds, 1:n_vars)
+                )
+            elseif occursin("nlopt-accurate", optimization)
+                n_vars = length(x0)
+                res, cost = nlopt_solve_accurate(
+                    G, d[:], x0,
+                    view(lb_bounds, 1:n_vars),
+                    view(ub_bounds, 1:n_vars)
+                )
+            elseif occursin("nlopt", optimization)
+                # Default nlopt (same as nlopt-fast)
+                n_vars = length(x0)
+                res, cost = nlopt_solve_fast(
+                    G, d[:], x0,
+                    view(lb_bounds, 1:n_vars),
+                    view(ub_bounds, 1:n_vars)
+                )
             elseif occursin("ldsqp", optimization)
                 res, cost = opt_solve(G, d[:], x0, zeros(length(x0)), ones(length(x0)))
             elseif occursin("inverse", optimization)
@@ -431,6 +453,30 @@ function _unmix_pixel_kernel(library::SpectralLibrary, img_dat::Matrix{Float64},
                         view(lb_bounds, 1:n_vars),
                         view(ub_bounds, 1:n_vars),
                         1e-3, 10, 1, inverse_method
+                    )
+                    costs[_comb] = lc
+                elseif occursin("nlopt-fast", optimization)
+                    n_vars = length(x0)
+                    ls, lc = nlopt_solve_fast(
+                        G, d[:], x0,
+                        view(lb_bounds, 1:n_vars),
+                        view(ub_bounds, 1:n_vars)
+                    )
+                    costs[_comb] = lc
+                elseif occursin("nlopt-accurate", optimization)
+                    n_vars = length(x0)
+                    ls, lc = nlopt_solve_accurate(
+                        G, d[:], x0,
+                        view(lb_bounds, 1:n_vars),
+                        view(ub_bounds, 1:n_vars)
+                    )
+                    costs[_comb] = lc
+                elseif occursin("nlopt", optimization)
+                    n_vars = length(x0)
+                    ls, lc = nlopt_solve_fast(
+                        G, d[:], x0,
+                        view(lb_bounds, 1:n_vars),
+                        view(ub_bounds, 1:n_vars)
                     )
                     costs[_comb] = lc
                 elseif optimization == "ldsqp"
