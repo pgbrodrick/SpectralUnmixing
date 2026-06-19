@@ -137,7 +137,7 @@ function bvls(A, b, x_lsq, lb, ub, tol::Float64, max_iter::Int64, verbose::Int64
     n_iter = 0
     m, n = size(A)
 
-    x = x_lsq
+    x = copy(x_lsq)  # Explicit copy for safety
     on_bound = zeros(n)
 
     mask = x .<= lb
@@ -152,10 +152,19 @@ function bvls(A, b, x_lsq, lb, ub, tol::Float64, max_iter::Int64, verbose::Int64
     active_set = .!free_set
     free_set = (1:size(free_set)[1])[free_set.!=0]
 
-    r = A * x - b
+    # Pre-allocate reusable buffers for the entire function
+    r = Vector{Float64}(undef, m)
+    g = Vector{Float64}(undef, n)
+    x_active = Vector{Float64}(undef, n)
+    Ax = Vector{Float64}(undef, m)
+    Ax_active = Vector{Float64}(undef, m)
+
+    # Initial residual and gradient
+    mul!(Ax, A, x)
+    r .= Ax .- b
     cost = 0.5 * dot(r, r)
     initial_cost = cost
-    g = A' * r
+    mul!(g, A', r)
 
     cost_change = nothing
     step_norm = nothing
@@ -170,7 +179,11 @@ function bvls(A, b, x_lsq, lb, ub, tol::Float64, max_iter::Int64, verbose::Int64
         x_free_old = x[free_set]
 
         A_free = A[:, free_set]
-        b_free = b - A * (x .* active_set)
+        # Compute b_free in-place: b - A * (x .* active_set)
+        x_active .= x .* active_set
+        mul!(Ax_active, A, x_active)
+        b_free = b .- Ax_active  # Note: still creates array, but reuses Ax_active buffer
+
         z = dolsq(A_free, b_free, method=inverse_method)
 
         lbv = z .< lb[free_set]
@@ -195,11 +208,16 @@ function bvls(A, b, x_lsq, lb, ub, tol::Float64, max_iter::Int64, verbose::Int64
         ind = free_set[.!v]
         x[ind] = z[.!v]
 
-        r = A * x - b
+        # Compute residual in-place
+        mul!(Ax, A, x)
+        r .= Ax .- b
         cost_new = 0.5 * dot(r, r)
         cost_change = cost - cost_new
         cost = cost_new
-        g = A' * r
+
+        # Compute gradient in-place
+        mul!(g, A', r)
+
         step_norm = sum((x[free_set] .- x_free_old) .^ 2)
 
         if any(v)
@@ -244,7 +262,11 @@ function bvls(A, b, x_lsq, lb, ub, tol::Float64, max_iter::Int64, verbose::Int64
             ub_free = ub[free_set]
 
             A_free = A[:, free_set]
-            b_free = b - A * (x .* active_set)
+            # Compute b_free in-place using pre-allocated buffers
+            x_active .= x .* active_set
+            mul!(Ax_active, A, x_active)
+            b_free = b .- Ax_active
+
             z = dolsq(A_free, b_free, method=inverse_method)
 
             lbv = (1:size(free_set)[1])[z.<lb_free]
@@ -281,7 +303,9 @@ function bvls(A, b, x_lsq, lb, ub, tol::Float64, max_iter::Int64, verbose::Int64
         @label start
         step_norm = sum((x_free .- x_free_old) .^ 2)
 
-        r = A * x - b
+        # Compute residual in-place
+        mul!(Ax, A, x)
+        r .= Ax .- b
         cost_new = 0.5 * dot(r, r)
         cost_change = cost - cost_new
 
@@ -291,7 +315,8 @@ function bvls(A, b, x_lsq, lb, ub, tol::Float64, max_iter::Int64, verbose::Int64
         end
         cost = cost_new
 
-        g = A' * r
+        # Compute gradient in-place
+        mul!(g, A', r)
         optimality = compute_kkt_optimality(g, on_bound)
     end #iteration
 
