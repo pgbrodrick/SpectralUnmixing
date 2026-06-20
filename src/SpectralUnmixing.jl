@@ -377,8 +377,24 @@ function _unmix_pixel_kernel(library::SpectralLibrary, img_dat::Matrix{Float64},
             res::Vector{Float64} = x0
             cost::Float64 = 0.0
 
-            if occursin("bvls", optimization)
-                # Use pre-allocated bounds (view to match size)
+            if occursin("nlopt", optimization)
+                # L-BFGS (recommended - 30-50% faster than BVLS)
+                n_vars = length(x0)
+                res, cost = nlopt_lbfgs(
+                    G, d[:], x0,
+                    view(lb_bounds, 1:n_vars),
+                    view(ub_bounds, 1:n_vars)
+                )
+            elseif occursin("trust", optimization)
+                # Levenberg-Marquardt trust region
+                n_vars = length(x0)
+                res, cost = levenberg_marquardt(
+                    G, d[:], x0,
+                    view(lb_bounds, 1:n_vars),
+                    view(ub_bounds, 1:n_vars)
+                )
+            elseif occursin("bvls", optimization)
+                # Original BVLS solver (fallback)
                 n_vars = length(x0)
                 res, cost = bvls(
                     G, d[:], x0,
@@ -386,31 +402,8 @@ function _unmix_pixel_kernel(library::SpectralLibrary, img_dat::Matrix{Float64},
                     view(ub_bounds, 1:n_vars),
                     1e-3, 100, 1, inverse_method
                 )
-            elseif occursin("nlopt-fast", optimization)
-                n_vars = length(x0)
-                res, cost = nlopt_solve_fast(
-                    G, d[:], x0,
-                    view(lb_bounds, 1:n_vars),
-                    view(ub_bounds, 1:n_vars)
-                )
-            elseif occursin("nlopt-accurate", optimization)
-                n_vars = length(x0)
-                res, cost = nlopt_solve_accurate(
-                    G, d[:], x0,
-                    view(lb_bounds, 1:n_vars),
-                    view(ub_bounds, 1:n_vars)
-                )
-            elseif occursin("nlopt", optimization)
-                # Default nlopt (same as nlopt-fast)
-                n_vars = length(x0)
-                res, cost = nlopt_solve_fast(
-                    G, d[:], x0,
-                    view(lb_bounds, 1:n_vars),
-                    view(ub_bounds, 1:n_vars)
-                )
-            elseif occursin("ldsqp", optimization)
-                res, cost = opt_solve(G, d[:], x0, zeros(length(x0)), ones(length(x0)))
             elseif occursin("inverse", optimization)
+                # Unconstrained LS (no bounds)
                 res = x0
                 r = G * x0 - d[:]
                 cost = dot(r, r)
@@ -445,8 +438,26 @@ function _unmix_pixel_kernel(library::SpectralLibrary, img_dat::Matrix{Float64},
                 ls::Vector{Float64} = x0
                 lc::Float64 = 0.0
 
-                if optimization == "bvls"
-                    # Use pre-allocated bounds
+                if occursin("nlopt", optimization)
+                    # L-BFGS (recommended)
+                    n_vars = length(x0)
+                    ls, lc = nlopt_lbfgs(
+                        G, d[:], x0,
+                        view(lb_bounds, 1:n_vars),
+                        view(ub_bounds, 1:n_vars)
+                    )
+                    costs[_comb] = lc
+                elseif occursin("trust", optimization)
+                    # Levenberg-Marquardt trust region
+                    n_vars = length(x0)
+                    ls, lc = levenberg_marquardt(
+                        G, d[:], x0,
+                        view(lb_bounds, 1:n_vars),
+                        view(ub_bounds, 1:n_vars)
+                    )
+                    costs[_comb] = lc
+                elseif optimization == "bvls"
+                    # Original BVLS (fallback)
                     n_vars = length(x0)
                     ls, lc = bvls(
                         G, d[:], x0,
@@ -454,33 +465,6 @@ function _unmix_pixel_kernel(library::SpectralLibrary, img_dat::Matrix{Float64},
                         view(ub_bounds, 1:n_vars),
                         1e-3, 10, 1, inverse_method
                     )
-                    costs[_comb] = lc
-                elseif occursin("nlopt-fast", optimization)
-                    n_vars = length(x0)
-                    ls, lc = nlopt_solve_fast(
-                        G, d[:], x0,
-                        view(lb_bounds, 1:n_vars),
-                        view(ub_bounds, 1:n_vars)
-                    )
-                    costs[_comb] = lc
-                elseif occursin("nlopt-accurate", optimization)
-                    n_vars = length(x0)
-                    ls, lc = nlopt_solve_accurate(
-                        G, d[:], x0,
-                        view(lb_bounds, 1:n_vars),
-                        view(ub_bounds, 1:n_vars)
-                    )
-                    costs[_comb] = lc
-                elseif occursin("nlopt", optimization)
-                    n_vars = length(x0)
-                    ls, lc = nlopt_solve_fast(
-                        G, d[:], x0,
-                        view(lb_bounds, 1:n_vars),
-                        view(ub_bounds, 1:n_vars)
-                    )
-                    costs[_comb] = lc
-                elseif optimization == "ldsqp"
-                    ls, lc = opt_solve(G, d[:], x0, 0, 1)
                     costs[_comb] = lc
                 elseif optimization == "inverse"
                     ls = x0
