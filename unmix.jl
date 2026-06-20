@@ -114,7 +114,7 @@ function parse_commandline()
         "--optimizer"
         arg_type = String
         default = "nlopt"
-        help = "Choice of core optimization.  Options = [nlopt, trust-region, bvls, inverse]. nlopt (L-BFGS) is recommended (30-50% faster than bvls)."
+        help = "Choice of core optimization.  Options = [nlopt, trust-region, levenberg-marquardt, bvls, inverse]."
 
         "--start_line"
         arg_type = Int64
