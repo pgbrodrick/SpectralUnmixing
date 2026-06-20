@@ -312,14 +312,7 @@ end
                         normalization::String, optimization::String,
                         max_combinations::Int64, combination_type::String)
 
-Type-stable kernel for pixel unmixing. All inputs are guaranteed to have stable types.
-
-# Returns
-- A tuple containing:
-  - `output_mixture::Vector{Float64}`: The estimated fraction of each class
-  - `output_mixture_var::Union{Nothing, Vector{Float64}}`: The variance of each class
-  - `output_comp_frac::Vector{Float64}`: The estimated fraction of each endmember
-  - `output_comp_frac_var::Union{Nothing, Vector{Float64}}`: The variance of each endmember
+Type-stable kernel for pixel unmixing using Task Local Storage for zero-allocations.
 """
 function _unmix_pixel_kernel(library::SpectralLibrary, img_dat::Matrix{Float64},
     unc_dat::Union{Nothing, Matrix{Float64}}, class_idx, options, mode::String,
@@ -376,14 +369,11 @@ function _unmix_pixel_kernel(library::SpectralLibrary, img_dat::Matrix{Float64},
             fill!(lb_view, 0.0)
             fill!(ub_view, 1.0)
 
-            if occursin("nlopt", optimization)
-                res, cost = nlopt_lbfgs(G, vec(d), x0, lb_view, ub_view, ws)
-            elseif occursin("trust", optimization)
-                res, cost = trust_region_newton(G, vec(d), x0, lb_view, ub_view, ws)
-            elseif occursin("levenberg", optimization) || occursin("marquardt", optimization)
+            if occursin("levenberg", optimization) || occursin("marquardt", optimization)
                 res, cost = levenberg_marquardt(G, vec(d), x0, lb_view, ub_view, ws)
             elseif occursin("bvls", optimization)
-                res, cost = bvls(G, vec(d), x0, lb_view, ub_view, 1e-3, -1, 1, inverse_method, ws)
+                # BVLS executed with regularizatizer lambda=1e-2
+                res, cost = bvls(G, vec(d), x0, lb_view, ub_view, 1e-3, -1, ws, lambda=1e-2)
             elseif occursin("inverse", optimization)
                 res = x0
                 r = G * x0 - vec(d)
@@ -422,17 +412,11 @@ function _unmix_pixel_kernel(library::SpectralLibrary, img_dat::Matrix{Float64},
                 fill!(lb_view, 0.0)
                 fill!(ub_view, 1.0)
 
-                if occursin("nlopt", optimization)
-                    ls, lc = nlopt_lbfgs(G, vec(d), x0, lb_view, ub_view, ws)
-                    costs[_comb] = lc
-                elseif occursin("trust", optimization)
-                    ls, lc = trust_region_newton(G, vec(d), x0, lb_view, ub_view, ws)
-                    costs[_comb] = lc
-                elseif occursin("levenberg", optimization) || occursin("marquardt", optimization)
+                if occursin("levenberg", optimization) || occursin("marquardt", optimization)
                     ls, lc = levenberg_marquardt(G, vec(d), x0, lb_view, ub_view, ws)
                     costs[_comb] = lc
                 elseif optimization == "bvls"
-                    ls, lc = bvls(G, vec(d), x0, lb_view, ub_view, 1e-3, -1, 1, inverse_method, ws)
+                    ls, lc = bvls(G, vec(d), x0, lb_view, ub_view, 1e-3, -1, 1, inverse_method, ws, lambda=1e-2)
                     costs[_comb] = lc
                 elseif optimization == "inverse"
                     ls = x0

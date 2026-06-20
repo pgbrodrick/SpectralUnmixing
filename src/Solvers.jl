@@ -14,18 +14,23 @@
 #
 # Author: Philip G. Brodrick, philip.g.brodrick@jpl.nasa.gov
 
-using JuMP
-using NLopt
 using LinearAlgebra
-
-import NLopt: Opt
 
 # ==============================================================================
 # ZERO-ALLOCATION TASK LOCAL STORAGE WORKSPACE
 # ==============================================================================
 
+"""
+    UnmixingWorkspace
+
+A Task Local Storage (TLS) workspace containing pre-allocated arrays and buffers 
+for zero-allocation execution of optimization algorithms. 
+
+This struct prevents garbage collection overhead during massively parallel 
+hyperspectral unmixing runs by providing dynamically sized mathematical workspaces 
+unique to each worker thread/process.
+"""
 struct UnmixingWorkspace
-    opts::Dict{Int, NLopt.Opt}     
     AtA::Matrix{Float64}
     Atb::Vector{Float64}
     Ax::Vector{Float64}
@@ -35,7 +40,7 @@ struct UnmixingWorkspace
     ub_bounds::Vector{Float64}     
     d_buffer::Matrix{Float64}      
     
-    # Mathematical buffers for Custom Solvers (BVLS, LM, Trust-Region)
+    # Mathematical buffers for Custom Solvers (BVLS, LM)
     g::Vector{Float64}
     H_work::Matrix{Float64}
     delta::Vector{Float64}
@@ -51,24 +56,27 @@ struct UnmixingWorkspace
     x_free_old::Vector{Float64}
     z::Vector{Float64}
     b_free::Vector{Float64}
-    lbv::Vector{Bool}
-    ubv::Vector{Bool}
-    v_mask::Vector{Bool}
-    alphas::Vector{Float64}
 end
 
+"""
+    get_workspace(n_bands::Int, max_endmembers::Int, img_size::Tuple)
+
+Retrieves the worker-local `UnmixingWorkspace` from Task Local Storage. 
+
+If the workspace does not exist on the current worker thread/process, it allocates 
+it exactly once and reuses the memory dynamically for all subsequent calls.
+
+# Arguments
+- `n_bands::Int`: The number of wavelength bands in the hyperspectral data.
+- `max_endmembers::Int`: The maximum number of endmembers that will be evaluated in a single combination.
+- `img_size::Tuple`: The dimensions of the image being processed.
+
+# Returns
+- `UnmixingWorkspace`: The zero-allocation workspace struct for the current worker.
+"""
 function get_workspace(n_bands::Int, max_endmembers::Int, img_size::Tuple)::UnmixingWorkspace
     if !haskey(task_local_storage(), :unmix_ws)
-        opts = Dict{Int, NLopt.Opt}()
-        for i in 1:max_endmembers
-            opt = NLopt.Opt(:LD_LBFGS, i)
-            opt.maxeval = 1000
-            opt.ftol_rel = 1e-3
-            opts[i] = opt
-        end
-        
         ws = UnmixingWorkspace(
-            opts,
             zeros(Float64, max_endmembers, max_endmembers),
             zeros(Float64, max_endmembers),
             zeros(Float64, n_bands),
@@ -93,11 +101,7 @@ function get_workspace(n_bands::Int, max_endmembers::Int, img_size::Tuple)::Unmi
             zeros(Float64, max_endmembers),
             zeros(Float64, max_endmembers),
             zeros(Float64, max_endmembers),
-            zeros(Float64, n_bands),
-            zeros(Bool, max_endmembers),
-            zeros(Bool, max_endmembers),
-            zeros(Bool, max_endmembers),
-            zeros(Float64, max_endmembers)
+            zeros(Float64, n_bands)
         )
         task_local_storage(:unmix_ws, ws)
     end
@@ -109,6 +113,21 @@ end
 # LINEAR ALGEBRA CORE
 # ==============================================================================
 
+"""
+    dolsq(A, b; method::String="default")
+
+Solve an unconstrained linear least squares problem, finding the vector `x` that 
+minimizes the residual ||Ax - b||².
+
+# Arguments
+- `A`: Coefficient matrix of size (m, n).
+- `b`: Target vector of size (m,).
+- `method::String`: Solver method to use. Options are `"default"` (backslash operator), 
+  `"pinv"` (pseudoinverse), or `"qr"` (QR decomposition).
+
+# Returns
+- `x`: Vector of size (n,) that minimizes the least squares residual.
+"""
 function dolsq(A, b; method::String="default")
     if method == "default"
         x = A \ b
@@ -122,8 +141,21 @@ function dolsq(A, b; method::String="default")
 end
 
 """
-Zero-allocation least squares solver for BVLS subproblems. Uses normal equations 
-and in-place Cholesky factorization.
+    dolsq_fast!(z_view::AbstractVector, A_view::AbstractMatrix, b_view::AbstractVector, 
+                ws::UnmixingWorkspace, lambda::Float64=0.0)
+
+Zero-allocation linear least squares solver designed specifically for BVLS active-set 
+subproblems. Uses normal equations and an in-place Cholesky factorization.
+
+# Arguments
+- `z_view::AbstractVector`: Pre-allocated output view to store the solution vector.
+- `A_view::AbstractMatrix`: View of the active coefficient matrix (A_free).
+- `b_view::AbstractVector`: View of the active target vector (b_free).
+- `ws::UnmixingWorkspace`: The worker-local pre-allocated memory workspace.
+- `lambda::Float64`: Tikhonov regularization (Ridge) penalty parameter (default: 0.0).
+
+# Returns
+- Modifies `z_view` in-place. Returns nothing.
 """
 function dolsq_fast!(z_view::AbstractVector, A_view::AbstractMatrix, b_view::AbstractVector, ws::UnmixingWorkspace, lambda::Float64=0.0)
     k = size(A_view, 2)
@@ -138,7 +170,6 @@ function dolsq_fast!(z_view::AbstractVector, A_view::AbstractMatrix, b_view::Abs
     mul!(H_view, A_view', A_view)
     mul!(g_view, A_view', b_view)
     
-    # Apply Tikhonov Regularization (Ridge) to the diagonal
     if lambda > 0.0
         for i in 1:k
             H_view[i, i] += lambda
@@ -146,61 +177,73 @@ function dolsq_fast!(z_view::AbstractVector, A_view::AbstractMatrix, b_view::Abs
     end
     
     try
+        # Fast, zero-allocation path
         H_fact = cholesky!(Symmetric(H_view))
         ldiv!(z_view, H_fact, g_view)
     catch
+        # Fallback if matrix is numerically singular
         z_view .= A_view \ b_view
     end
+end
+
+"""
+    compute_kkt_optimality_fast!(g_kkt::AbstractVector, g::AbstractVector, on_bound::AbstractVector)
+
+Computes the Karush-Kuhn-Tucker (KKT) optimality condition value for a given gradient 
+vector and boundary status without allocating memory.
+
+# Arguments
+- `g_kkt::AbstractVector`: Pre-allocated view to store the resulting KKT values.
+- `g::AbstractVector`: The gradient of the objective function.
+- `on_bound::AbstractVector`: Indicator vector for variable status (-1 for lower bound, 
+  1 for upper bound, 0 for free).
+
+# Returns
+- `max_kkt::Float64`: The maximum KKT condition value across all variables.
+"""
+function compute_kkt_optimality_fast!(g_kkt::AbstractVector, g::AbstractVector, on_bound::AbstractVector)
+    n = length(g)
+    max_kkt = 0.0
+    for i in 1:n
+        val = on_bound[i] == 0 ? abs(g[i]) : g[i] * on_bound[i]
+        g_kkt[i] = val
+        if val > max_kkt
+            max_kkt = val
+        end
+    end
+    return max_kkt
 end
 
 # ==============================================================================
 # OPTIMIZERS
 # ==============================================================================
 
-function nlopt_solve_fast(A::AbstractMatrix{Float64}, b::AbstractVector{Float64}, x0::AbstractVector{Float64},
-                          lb::AbstractVector{Float64}, ub::AbstractVector{Float64}, ws::UnmixingWorkspace;
-                          maxeval::Int=1000, ftol_rel::Float64=1e-3)
+"""
+    levenberg_marquardt(A::AbstractMatrix{Float64}, b::AbstractVector{Float64}, 
+                        x0::AbstractVector{Float64}, lb::AbstractVector{Float64}, 
+                        ub::AbstractVector{Float64}, ws::UnmixingWorkspace;
+                        lambda0::Float64=1e-3, lambda_up::Float64=10.0, 
+                        lambda_down::Float64=0.1, max_iter::Int=1000, tol::Float64=1e-3)
 
-    n_vars = length(x0)
-    m_bands = length(b)
+Bounded Levenberg-Marquardt damped least squares solver for ||Ax - b||². 
+Utilizes the zero-allocation workspace for rapid execution.
 
-    opt = ws.opts[n_vars]
-    opt.lower_bounds = lb
-    opt.upper_bounds = ub
-    opt.maxeval = maxeval
-    opt.ftol_rel = ftol_rel
+# Arguments
+- `A`: Coefficient matrix (m × n).
+- `b`: Target vector (m,).
+- `x0`: Initial guess (n,), which will be clamped to bounds.
+- `lb`, `ub`: Lower and upper bounds (n,).
+- `ws::UnmixingWorkspace`: Pre-allocated Task Local Storage workspace.
+- `lambda0::Float64`: Initial damping parameter (default: 1e-3).
+- `lambda_up::Float64`: Factor to increase λ on rejection (default: 10.0).
+- `lambda_down::Float64`: Factor to decrease λ on acceptance (default: 0.1).
+- `max_iter::Int`: Maximum number of iterations allowed (default: 1000).
+- `tol::Float64`: Convergence tolerance on the gradient norm (default: 1e-3).
 
-    AtA_view  = @view ws.AtA[1:n_vars, 1:n_vars]
-    Atb_view  = @view ws.Atb[1:n_vars]
-    AtAx_view = @view ws.AtAx[1:n_vars]
-    Ax_view   = @view ws.Ax[1:m_bands]
-    res_view  = @view ws.residual[1:m_bands]
-
-    mul!(AtA_view, A', A)
-    mul!(Atb_view, A', b)
-
-    function objective_with_grad!(x::Vector{Float64}, grad::Vector{Float64})
-        if length(grad) > 0
-            mul!(AtAx_view, AtA_view, x)
-            grad .= AtAx_view .- Atb_view
-        end
-        mul!(Ax_view, A, x)
-        res_view .= Ax_view .- b
-        return 0.5 * dot(res_view, res_view)
-    end
-
-    opt.min_objective = objective_with_grad!
-    x_init = clamp.(x0, lb, ub) 
-    (minf, minx, ret) = NLopt.optimize(opt, x_init)
-
-    return minx, 2.0 * minf 
-end
-
-function nlopt_lbfgs(A::AbstractMatrix{Float64}, b::AbstractVector{Float64}, x0::AbstractVector{Float64},
-                     lb::AbstractVector{Float64}, ub::AbstractVector{Float64}, ws::UnmixingWorkspace)
-    return nlopt_solve_fast(A, b, x0, lb, ub, ws, maxeval=1000, ftol_rel=1e-3)
-end
-
+# Returns
+- `x`: Optimized solution vector.
+- `cost`: Final cost ||Ax - b||² (including damping penalty).
+"""
 function levenberg_marquardt(A::AbstractMatrix{Float64}, b::AbstractVector{Float64}, x0::AbstractVector{Float64},
                              lb::AbstractVector{Float64}, ub::AbstractVector{Float64}, ws::UnmixingWorkspace;
                              lambda0::Float64=1e-3, lambda_up::Float64=10.0, lambda_down::Float64=0.1, max_iter::Int=1000, tol::Float64=1e-3)
@@ -231,7 +274,6 @@ function levenberg_marquardt(A::AbstractMatrix{Float64}, b::AbstractVector{Float
             break
         end
 
-        # In-place damping and factorization
         H .= JtJ
         for i in 1:n
             H[i,i] += lambda
@@ -269,112 +311,41 @@ function levenberg_marquardt(A::AbstractMatrix{Float64}, b::AbstractVector{Float
     return x, 2.0 * cost 
 end
 
-function trust_region_newton(A::AbstractMatrix{Float64}, b::AbstractVector{Float64}, x0::AbstractVector{Float64},
-                             lb::AbstractVector{Float64}, ub::AbstractVector{Float64}, ws::UnmixingWorkspace;
-                             Delta0::Float64=1.0, max_iter::Int=1000, tol::Float64=1e-3,
-                             eta1::Float64=0.1, eta2::Float64=0.75, gamma1::Float64=0.5, gamma2::Float64=2.0)
+"""
+    bvls(A::AbstractMatrix{Float64}, b::AbstractVector{Float64}, x_lsq::AbstractVector{Float64}, 
+         lb::AbstractVector{Float64}, ub::AbstractVector{Float64}, tol::Float64, 
+         max_iter::Int64, verbose::Int64, inverse_method::String, ws::UnmixingWorkspace;
+         lambda::Float64=0.0)
 
-    m, n = size(A)
-    x = clamp.(x0, lb, ub)
-    Delta = Delta0
-    
-    H = @view ws.AtA[1:n, 1:n]
-    mul!(H, A', A) 
-    
-    # Pre-factorize once!
-    H_fact = try cholesky(Symmetric(H)) catch; nothing end
+Solve a bounded variable least squares problem, finding the vector `x` subject to lower (`lb`)
+and upper (`ub`) bounds that minimizes the residual ||Ax - b||². 
 
-    r = @view ws.residual[1:m]
-    Ax = @view ws.Ax[1:m]
-    g = @view ws.g[1:n]
-    s = @view ws.delta[1:n]
-    x_new = @view ws.x_new[1:n]
-    Ax_new = @view ws.Ax_new[1:m]
-    r_new = @view ws.r_new[1:m]
+See https://www.stat.berkeley.edu/~stark/Preprints/bvls.pdf for details.
 
-    mul!(Ax, A, x)
-    r .= Ax .- b
-    f = 0.5 * dot(r, r)
-    mul!(g, A', r)
+This implementation uses an active-set (Lawson-Hanson style) method. It evaluates true KKT 
+optimality conditions to definitively pin variables to bounds. This version is completely 
+allocation-free, utilizing the `UnmixingWorkspace` and in-place subproblem solvers.
 
-    for iter in 1:max_iter
-        if norm(g) < tol
-            break
-        end
+# Arguments
+- `A`: Coefficient matrix of size (m, n).
+- `b`: Target vector of size (m,).
+- `x_lsq`: Initial guess vector of size (n,) for the optimization variables.
+- `lb`: Vector of size (n,) specifying the lower bounds.
+- `ub`: Vector of size (n,) specifying the upper bounds.
+- `tol::Float64`: Tolerance for convergence based on the maximum KKT condition.
+- `max_iter::Int64`: Maximum number of iterations. If -1, defaults to 5n.
+- `ws::UnmixingWorkspace`: Pre-allocated Task Local Storage workspace.
+- `lambda::Float64`: Tikhonov regularization (Ridge) parameter added to the normal 
+  equations to stabilize collinear endmembers (default: 0.0).
 
-        s_newton = !isnothing(H_fact) ? -(H_fact \ g) : -(H \ g)
-        norm_newton = norm(s_newton)
-
-        if norm_newton <= Delta
-            s .= s_newton
-        else
-            Hg = H * g
-            alpha = dot(g, g) / dot(g, Hg)
-            s_cauchy = -alpha * g
-            norm_cauchy = norm(s_cauchy)
-
-            if norm_cauchy >= Delta
-                s .= (Delta / norm_cauchy) * s_cauchy
-            else
-                diff = s_newton - s_cauchy
-                a = dot(diff, diff)
-                b_coef = 2 * dot(s_cauchy, diff)
-                c = dot(s_cauchy, s_cauchy) - Delta^2
-
-                tau = (-b_coef + sqrt(b_coef^2 - 4*a*c)) / (2*a)
-                tau = clamp(tau, 0.0, 1.0)
-                s .= s_cauchy .+ tau * diff
-            end
-        end
-
-        x_new .= clamp.(x .+ s, lb, ub)
-        mul!(Ax_new, A, x_new)
-        r_new .= Ax_new .- b
-        f_new = 0.5 * dot(r_new, r_new)
-
-        actual_red = f - f_new
-        Hs = H * s
-        predicted_red = -(dot(g, s) + 0.5 * dot(s, Hs))
-
-        rho = abs(predicted_red) < 1e-12 ? 1.0 : actual_red / predicted_red
-
-        if rho < eta1
-            Delta *= gamma1
-        elseif rho > eta2 && norm(s) ≈ Delta
-            Delta *= gamma2
-        end
-
-        if rho > eta1
-            x .= x_new
-            Ax .= Ax_new
-            r .= r_new
-            f = f_new
-            mul!(g, A', r)
-        end
-
-        Delta = clamp(Delta, 1e-8, 1e3)
-    end
-
-    return x, 2.0 * f
-end
-
-function compute_kkt_optimality_fast!(g_kkt::AbstractVector, g::AbstractVector, on_bound::AbstractVector)
-    n = length(g)
-    max_kkt = 0.0
-    for i in 1:n
-        val = on_bound[i] == 0 ? abs(g[i]) : g[i] * on_bound[i]
-        g_kkt[i] = val
-        if val > max_kkt
-            max_kkt = val
-        end
-    end
-    return max_kkt
-end
-
+# Returns
+- `x`: Vector of size (n,) that minimizes the least squares residual.
+- `cost`: The final cost function value of the minimized sum of squared residuals.
+"""
 function bvls(A::AbstractMatrix{Float64}, b::AbstractVector{Float64}, x_lsq::AbstractVector{Float64}, 
               lb::AbstractVector{Float64}, ub::AbstractVector{Float64}, 
-              tol::Float64, max_iter::Int64, verbose::Int64, inverse_method::String, ws::UnmixingWorkspace;
-              lambda::Float64=0.0) # Added lambda keyword argument
+              tol::Float64, max_iter::Int64, ws::UnmixingWorkspace;
+              lambda::Float64=0.0)
 
     m, n = size(A)
     x = copy(x_lsq)
@@ -387,7 +358,7 @@ function bvls(A::AbstractMatrix{Float64}, b::AbstractVector{Float64}, x_lsq::Abs
     g = @view ws.g[1:n]
     Ax = @view ws.Ax[1:m]
     b_free = @view ws.b_free[1:m]
-    g_kkt = @view ws.AtAx[1:n]
+    g_kkt = @view ws.AtAx[1:n] 
 
     on_bound .= 0
     for i in 1:n
@@ -402,8 +373,6 @@ function bvls(A::AbstractMatrix{Float64}, b::AbstractVector{Float64}, x_lsq::Abs
 
     mul!(Ax, A, x)
     r .= Ax .- b
-    
-    # Regularized Cost & Gradient
     cost = 0.5 * dot(r, r) + 0.5 * lambda * dot(x, x)
     mul!(g, A', r)
     if lambda > 0.0
@@ -412,91 +381,17 @@ function bvls(A::AbstractMatrix{Float64}, b::AbstractVector{Float64}, x_lsq::Abs
         end
     end
 
-    iteration = 0
-    
-    while true
-        n_free = 0
-        for i in 1:n
-            if on_bound[i] == 0
-                n_free += 1
-                free_set[n_free] = i
-                active_set[i] = false
-            else
-                active_set[i] = true
-            end
-        end
-
-        if n_free == 0
-            break
-        end
-
-        iteration += 1
-        free_idx = @view free_set[1:n_free]
-        
-        x_free_old = @view ws.x_free_old[1:n_free]
-        for i in 1:n_free
-            x_free_old[i] = x[free_idx[i]]
-        end
-
-        A_free = @view A[:, free_idx]
-        b_free .= b
-        for i in 1:n
-            if active_set[i]
-                for j in 1:m
-                    b_free[j] -= A[j, i] * x[i]
-                end
-            end
-        end
-
-        z_free = @view ws.z[1:n_free]
-        
-        # Pass lambda to the linear solver
-        #dolsq_fast!(z_free, A_free, b_free, ws, lambda)
-        dolsq(A_free, b_free)
-
-        bound_hit = false
-        for i in 1:n_free
-            fi = free_idx[i]
-            if z_free[i] <= lb[fi]
-                x[fi] = lb[fi]
-                on_bound[fi] = -1
-                bound_hit = true
-            elseif z_free[i] >= ub[fi]
-                x[fi] = ub[fi]
-                on_bound[fi] = 1
-                bound_hit = true
-            else
-                x[fi] = z_free[i]
-            end
-        end
-
-        mul!(Ax, A, x)
-        r .= Ax .- b
-        
-        # Regularized Cost & Gradient
-        cost = 0.5 * dot(r, r) + 0.5 * lambda * dot(x, x)
-        mul!(g, A', r)
-        if lambda > 0.0
-            for i in 1:n
-                g[i] += lambda * x[i]
-            end
-        end
-
-        if !bound_hit
-            break
-        end
-    end
-
-    max_iter = max_iter == -1 ? n : max_iter + iteration
+    max_iter = max_iter == -1 ? n * 5 : max_iter + n
     termination_status = 0
 
-    for iter in iteration:max_iter
+    for iter in 1:max_iter
         optimality = compute_kkt_optimality_fast!(g_kkt, g, on_bound)
         if optimality < tol
             termination_status = 1
             break
         end
 
+        # Find best constrained variable to release
         max_val = -Inf
         move_to_free = 1
         for i in 1:n
@@ -520,6 +415,10 @@ function bvls(A::AbstractMatrix{Float64}, b::AbstractVector{Float64}, x_lsq::Abs
                 end
             end
 
+            if n_free == 0
+                break
+            end
+
             free_idx = @view free_set[1:n_free]
             x_free = @view ws.x_free[1:n_free]
             for i in 1:n_free
@@ -537,8 +436,6 @@ function bvls(A::AbstractMatrix{Float64}, b::AbstractVector{Float64}, x_lsq::Abs
             end
 
             z_free = @view ws.z[1:n_free]
-            
-            # Pass lambda to the linear solver
             dolsq_fast!(z_free, A_free, b_free, ws, lambda)
 
             min_alpha = Inf
@@ -579,9 +476,8 @@ function bvls(A::AbstractMatrix{Float64}, b::AbstractVector{Float64}, x_lsq::Abs
 
         mul!(Ax, A, x)
         r .= Ax .- b
-        
-        # Regularized Cost & Gradient Update
         cost_new = 0.5 * dot(r, r) + 0.5 * lambda * dot(x, x)
+        
         if (cost - cost_new) < tol * cost
             termination_status = 2
         end
