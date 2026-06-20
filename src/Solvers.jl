@@ -125,25 +125,30 @@ end
 Zero-allocation least squares solver for BVLS subproblems. Uses normal equations 
 and in-place Cholesky factorization.
 """
-function dolsq_fast!(z_view::AbstractVector, A_view::AbstractMatrix, b_view::AbstractVector, ws::UnmixingWorkspace)
+function dolsq_fast!(z_view::AbstractVector, A_view::AbstractMatrix, b_view::AbstractVector, ws::UnmixingWorkspace, lambda::Float64=0.0)
     k = size(A_view, 2)
     if k == 0
         return
     end
 
     H_view = @view ws.H_work[1:k, 1:k]
-    g_view = @view ws.Atb[1:k] # Safely reuse Atb as a working gradient array
+    g_view = @view ws.Atb[1:k] 
     
     # (A'A)z = A'b
     mul!(H_view, A_view', A_view)
     mul!(g_view, A_view', b_view)
     
+    # Apply Tikhonov Regularization (Ridge) to the diagonal
+    if lambda > 0.0
+        for i in 1:k
+            H_view[i, i] += lambda
+        end
+    end
+    
     try
-        # Fast, zero-allocation path
         H_fact = cholesky!(Symmetric(H_view))
         ldiv!(z_view, H_fact, g_view)
     catch
-        # Fallback if matrix is numerically singular (rare)
         z_view .= A_view \ b_view
     end
 end
@@ -266,7 +271,7 @@ end
 
 function trust_region_newton(A::AbstractMatrix{Float64}, b::AbstractVector{Float64}, x0::AbstractVector{Float64},
                              lb::AbstractVector{Float64}, ub::AbstractVector{Float64}, ws::UnmixingWorkspace;
-                             Delta0::Float64=1.0, max_iter::Int=10, tol::Float64=1e-3,
+                             Delta0::Float64=1.0, max_iter::Int=1000, tol::Float64=1e-3,
                              eta1::Float64=0.1, eta2::Float64=0.75, gamma1::Float64=0.5, gamma2::Float64=2.0)
 
     m, n = size(A)
@@ -368,7 +373,8 @@ end
 
 function bvls(A::AbstractMatrix{Float64}, b::AbstractVector{Float64}, x_lsq::AbstractVector{Float64}, 
               lb::AbstractVector{Float64}, ub::AbstractVector{Float64}, 
-              tol::Float64, max_iter::Int64, verbose::Int64, inverse_method::String, ws::UnmixingWorkspace)
+              tol::Float64, max_iter::Int64, verbose::Int64, inverse_method::String, ws::UnmixingWorkspace;
+              lambda::Float64=0.0) # Added lambda keyword argument
 
     m, n = size(A)
     x = copy(x_lsq)
@@ -381,7 +387,7 @@ function bvls(A::AbstractMatrix{Float64}, b::AbstractVector{Float64}, x_lsq::Abs
     g = @view ws.g[1:n]
     Ax = @view ws.Ax[1:m]
     b_free = @view ws.b_free[1:m]
-    g_kkt = @view ws.AtAx[1:n] # Reuse as buffer
+    g_kkt = @view ws.AtAx[1:n]
 
     on_bound .= 0
     for i in 1:n
@@ -396,12 +402,18 @@ function bvls(A::AbstractMatrix{Float64}, b::AbstractVector{Float64}, x_lsq::Abs
 
     mul!(Ax, A, x)
     r .= Ax .- b
-    cost = 0.5 * dot(r, r)
+    
+    # Regularized Cost & Gradient
+    cost = 0.5 * dot(r, r) + 0.5 * lambda * dot(x, x)
     mul!(g, A', r)
+    if lambda > 0.0
+        for i in 1:n
+            g[i] += lambda * x[i]
+        end
+    end
 
     iteration = 0
     
-    # Outer active set loop
     while true
         n_free = 0
         for i in 1:n
@@ -427,8 +439,6 @@ function bvls(A::AbstractMatrix{Float64}, b::AbstractVector{Float64}, x_lsq::Abs
         end
 
         A_free = @view A[:, free_idx]
-        
-        # b_free = b - A * (x .* active_set)
         b_free .= b
         for i in 1:n
             if active_set[i]
@@ -439,7 +449,10 @@ function bvls(A::AbstractMatrix{Float64}, b::AbstractVector{Float64}, x_lsq::Abs
         end
 
         z_free = @view ws.z[1:n_free]
-        dolsq_fast!(z_free, A_free, b_free, ws)
+        
+        # Pass lambda to the linear solver
+        #dolsq_fast!(z_free, A_free, b_free, ws, lambda)
+        dolsq(A_free, b_free)
 
         bound_hit = false
         for i in 1:n_free
@@ -459,8 +472,15 @@ function bvls(A::AbstractMatrix{Float64}, b::AbstractVector{Float64}, x_lsq::Abs
 
         mul!(Ax, A, x)
         r .= Ax .- b
-        cost = 0.5 * dot(r, r)
+        
+        # Regularized Cost & Gradient
+        cost = 0.5 * dot(r, r) + 0.5 * lambda * dot(x, x)
         mul!(g, A', r)
+        if lambda > 0.0
+            for i in 1:n
+                g[i] += lambda * x[i]
+            end
+        end
 
         if !bound_hit
             break
@@ -477,7 +497,6 @@ function bvls(A::AbstractMatrix{Float64}, b::AbstractVector{Float64}, x_lsq::Abs
             break
         end
 
-        # Find best constrained variable to release
         max_val = -Inf
         move_to_free = 1
         for i in 1:n
@@ -518,9 +537,10 @@ function bvls(A::AbstractMatrix{Float64}, b::AbstractVector{Float64}, x_lsq::Abs
             end
 
             z_free = @view ws.z[1:n_free]
-            dolsq_fast!(z_free, A_free, b_free, ws)
+            
+            # Pass lambda to the linear solver
+            dolsq_fast!(z_free, A_free, b_free, ws, lambda)
 
-            # Check bounds and find max alpha step
             min_alpha = Inf
             i_free_limit = -1
             bound_type = 0
@@ -559,13 +579,19 @@ function bvls(A::AbstractMatrix{Float64}, b::AbstractVector{Float64}, x_lsq::Abs
 
         mul!(Ax, A, x)
         r .= Ax .- b
-        cost_new = 0.5 * dot(r, r)
         
+        # Regularized Cost & Gradient Update
+        cost_new = 0.5 * dot(r, r) + 0.5 * lambda * dot(x, x)
         if (cost - cost_new) < tol * cost
             termination_status = 2
         end
         cost = cost_new
         mul!(g, A', r)
+        if lambda > 0.0
+            for i in 1:n
+                g[i] += lambda * x[i]
+            end
+        end
     end
 
     x[x .< 1e-5] .= 0
