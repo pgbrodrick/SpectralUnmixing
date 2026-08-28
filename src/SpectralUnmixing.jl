@@ -312,14 +312,7 @@ end
                         normalization::String, optimization::String,
                         max_combinations::Int64, combination_type::String)
 
-Type-stable kernel for pixel unmixing. All inputs are guaranteed to have stable types.
-
-# Returns
-- A tuple containing:
-  - `output_mixture::Vector{Float64}`: The estimated fraction of each class
-  - `output_mixture_var::Union{Nothing, Vector{Float64}}`: The variance of each class
-  - `output_comp_frac::Vector{Float64}`: The estimated fraction of each endmember
-  - `output_comp_frac_var::Union{Nothing, Vector{Float64}}`: The variance of each endmember
+Type-stable kernel for pixel unmixing using Task Local Storage for zero-allocations.
 """
 function _unmix_pixel_kernel(library::SpectralLibrary, img_dat::Matrix{Float64},
     unc_dat::Union{Nothing, Matrix{Float64}}, class_idx, options, mode::String,
@@ -329,8 +322,6 @@ function _unmix_pixel_kernel(library::SpectralLibrary, img_dat::Matrix{Float64},
     mc_comp_frac = zeros(n_mc, size(library.spectra)[1] + 1)
     scores = zeros(n_mc)
 
-    # Pre-allocate buffers to reuse across MC iterations
-    d_buffer = similar(img_dat)  # Reusable buffer for perturbed data
     n_bands = sum(library.good_bands)
     max_perm_size = if mode == "sma" || mode == "sma-best"
         num_endmembers[1] == -1 ? size(library.spectra)[1] : num_endmembers[1]
@@ -338,18 +329,15 @@ function _unmix_pixel_kernel(library::SpectralLibrary, img_dat::Matrix{Float64},
         maximum(length, options)
     end
 
-    # Pre-allocate bounds arrays for BVLS (reused across MC iterations)
-    lb_bounds = zeros(Float64, max_perm_size)
-    ub_bounds = ones(Float64, max_perm_size)
+    # Fetch the dynamically sized, zero-allocation workspace
+    ws = get_workspace(n_bands, max_perm_size, size(img_dat))
 
-    for mc in 1:n_mc #monte carlo loop
+    for mc in 1:n_mc 
         rng = StableRNG(mc)
 
-        # Reuse buffer instead of allocating new array
         if !isnothing(unc_dat)
-            # In-place perturbation
-            d_buffer .= img_dat .+ (rand(rng, size(img_dat)...) .* 2 .- 1) .* unc_dat
-            d = d_buffer
+            ws.d_buffer .= img_dat .+ (rand(rng, size(img_dat)...) .* 2 .- 1) .* unc_dat
+            d = ws.d_buffer
         else
             d = img_dat
         end
@@ -367,78 +355,72 @@ function _unmix_pixel_kernel(library::SpectralLibrary, img_dat::Matrix{Float64},
                 class_idx, num_endmembers, combination_type, size(library.spectra)[1]
             )
             G = library.spectra[perm, library.good_bands]
-
             G = scale_data(G, library.wavelengths[library.good_bands], normalization)'
 
             x0 = dolsq(G, d', method=inverse_method)
+            x0 = vec(x0) 
 
-            x0 = x0[:]
-            # Declare with explicit type to help compiler
             res::Vector{Float64} = x0
             cost::Float64 = 0.0
+            n_vars = length(x0)
 
-            if occursin("bvls", optimization)
-                # Use pre-allocated bounds (view to match size)
-                n_vars = length(x0)
-                res, cost = bvls(
-                    G, d[:], x0,
-                    view(lb_bounds, 1:n_vars),
-                    view(ub_bounds, 1:n_vars),
-                    1e-3, 100, 1, inverse_method
-                )
-            elseif occursin("ldsqp", optimization)
-                res, cost = opt_solve(G, d[:], x0, zeros(length(x0)), ones(length(x0)))
+            lb_view = @view ws.lb_bounds[1:n_vars]
+            ub_view = @view ws.ub_bounds[1:n_vars]
+            fill!(lb_view, 0.0)
+            fill!(ub_view, 1.0)
+
+            if occursin("levenberg", optimization) || occursin("marquardt", optimization)
+                res, cost = levenberg_marquardt(G, vec(d), x0, lb_view, ub_view, ws)
+            elseif occursin("bvls", optimization)
+                # BVLS executed with regularizatizer lambda=1e-2
+                res, cost = bvls(G, vec(d), x0, lb_view, ub_view, 1e-3, -1, ws, lambda=1e-2)
             elseif occursin("inverse", optimization)
                 res = x0
-                r = G * x0 - d[:]
+                r = G * x0 - vec(d)
                 cost = dot(r, r)
             end
+            
             mc_comp_frac[mc, perm] = res
             scores[mc] = cost
 
         elseif mode == "mesma" || mode == "mesma-best"
-            # Determine the permutation of options to evaluate
             if max_combinations != -1 && length(options) > max_combinations
                 perm = randperm(rng, length(options))[1:max_combinations]
             else
                 perm = convert(Vector{Int64}, 1:length(options))
             end
 
-            # Pre-allocate with explicit type for type stability
             n_combs = length(perm)
             solutions = Vector{Vector{Float64}}(undef, n_combs)
             costs = zeros(Float64, n_combs) .+ 1e12
 
             for (_comb, comb) in enumerate(options[perm])
                 comb = [c for c in comb]
-                #G = hcat(library.spectra[comb,:], ones(size(library.spectra[comb,:])[1],1))
                 G = scale_data(
                     library.spectra[comb, library.good_bands],
                     library.wavelengths[library.good_bands], normalization
                 )'
                 x0 = dolsq(G, d')
-                x0 = x0[:]
+                x0 = vec(x0)
 
-                # Type-stable declaration
                 ls::Vector{Float64} = x0
                 lc::Float64 = 0.0
+                n_vars = length(x0)
 
-                if optimization == "bvls"
-                    # Use pre-allocated bounds
-                    n_vars = length(x0)
-                    ls, lc = bvls(
-                        G, d[:], x0,
-                        view(lb_bounds, 1:n_vars),
-                        view(ub_bounds, 1:n_vars),
-                        1e-3, 10, 1, inverse_method
-                    )
+                lb_view = @view ws.lb_bounds[1:n_vars]
+                ub_view = @view ws.ub_bounds[1:n_vars]
+                fill!(lb_view, 0.0)
+                fill!(ub_view, 1.0)
+
+                if occursin("levenberg", optimization) || occursin("marquardt", optimization)
+                    ls, lc = levenberg_marquardt(G, vec(d), x0, lb_view, ub_view, ws)
                     costs[_comb] = lc
-                elseif optimization == "ldsqp"
-                    ls, lc = opt_solve(G, d[:], x0, 0, 1)
+                elseif optimization == "bvls"
+                    ls, lc = bvls(G, vec(d), x0, lb_view, ub_view, 1e-3, -1, 1, inverse_method, ws, lambda=1e-2)
                     costs[_comb] = lc
                 elseif optimization == "inverse"
                     ls = x0
-                    r = G * x0 - d[:]
+                    r = G * x0 - vec(d)
                     lc = dot(r, r)
                     costs[_comb] = lc
                 end
@@ -447,7 +429,6 @@ function _unmix_pixel_kernel(library::SpectralLibrary, img_dat::Matrix{Float64},
 
             best = argmin(costs)
             scores[mc] = costs[best]
-
             mc_comp_frac[mc, [ind for ind in options[perm][best]]] = solutions[best]
 
         else
@@ -455,17 +436,14 @@ function _unmix_pixel_kernel(library::SpectralLibrary, img_dat::Matrix{Float64},
         end
     end
 
-    # Calculate the sum of values (inverse of shade), and then normalize
     mc_comp_frac[mc_comp_frac.<0] .= 0
     mc_comp_frac[:, end] = sum(mc_comp_frac, dims=2)
     mc_comp_frac[:, 1:end-1] = mc_comp_frac[:, 1:end-1] ./ mc_comp_frac[:, end]
 
-    # Aggregate results from per-library to per-unique-class
     mixture_results = zeros(size(mc_comp_frac)[1], length(library.class_valid_keys) + 1)
     for _i in 1:size(mc_comp_frac)[1]
         for (_class, cl) in enumerate(library.class_valid_keys)
-            mixture_results[_i, _class] =
-                sum(mc_comp_frac[_i, 1:end-1][cl.==library.classes])
+            mixture_results[_i, _class] = sum(mc_comp_frac[_i, 1:end-1][cl.==library.classes])
         end
         mixture_results[_i, end] = mc_comp_frac[_i, end]
     end

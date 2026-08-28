@@ -113,8 +113,8 @@ function parse_commandline()
 
         "--optimizer"
         arg_type = String
-        default = "bvls"
-        help = "Choice of core optimization.  Options = [inverse, bvls, ldsqp]"
+        default = "nlopt"
+        help = "Choice of core optimization.  Options = [bvls (preferred), levenberg-marquardt, inverse]."
 
         "--start_line"
         arg_type = Int64
